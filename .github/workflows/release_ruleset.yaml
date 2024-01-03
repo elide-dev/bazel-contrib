@@ -5,6 +5,10 @@
 # - .github/workflows/release_prep.sh
 # - .github/workflows/ci.bazelrc
 # - .bazelrc
+#
+# For the suite of files designated as release assets, SLSA provenance material will be generated automatically,
+# and included in the release artifacts on GitHub. Read more here:
+# https://github.com/slsa-framework/slsa-github-generator/blob/main/internal/builders/generic/README.md
 
 on:
   # Make this workflow reusable, see
@@ -17,37 +21,114 @@ on:
           Newline-delimited globs of paths to assets to upload for release.
           See https://github.com/softprops/action-gh-release#inputs
         type: string
+
       prerelease:
         default: true
         description: Indicator of whether or not is a prerelease
         type: boolean
 
+      artifact:
+        default: 'bazel-rules-release'
+        description: Release artifact name
+        type: string
+
+      generate_release_notes:
+        default: true
+        description: Whether to generate release notes automatically
+        type: boolean
+
+      retention_days:
+        default: 7
+        description: Number of days to retain the artifact
+        type: number
+
+      dry:
+        default: false
+        description: Perform a release dry-run, which emits a draft release
+        type: boolean
+
+      provenance:
+        default: true
+        description: Whether to generate provenance material
+        type: boolean
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
     steps:
-      - name: Checkout
+      - name: "Setup: Harden Runner"
+        uses: step-security/harden-runner@eb238b55efaa70779f274895e782ed17c84f2895 # v2.6.1
+        with:
+          egress-policy: audit
+      - name: "Setup: Checkout"
         uses: actions/checkout@v3
-      - name: Mount bazel caches
+        with:
+          persist-credentials: false
+      - name: "Setup: Bazel Caches"
         uses: actions/cache@v3
         with:
           path: |
             ~/.cache/bazel
           key: bazel-cache-${{ hashFiles('**/BUILD.bazel', '**/*.bzl', 'WORKSPACE') }}
           restore-keys: bazel-cache-
-      - name: bazel test //...
+      - name: "Build: bazel test //..."
         env:
           # Bazelisk will download bazel to here.
           XDG_CACHE_HOME: ~/.cache/bazel-repo
         run: bazel --bazelrc=.github/workflows/ci.bazelrc --bazelrc=.bazelrc test //...
-      - name: Prepare release notes and artifacts
+      - name: "Build: Release Notes & Artifacts"
         run: .github/workflows/release_prep.sh ${{ env.GITHUB_REF_NAME }} > release_notes.txt
-      - name: Release
+      - name: Generate provenance hashes
+        shell: bash
+        id: hash
+        run: |
+          # sha256sum generates sha256 hash for all artifacts.
+          # base64 -w0 encodes to base64 and outputs on a single line.
+          echo "hashes=$(sha256sum ${{ inputs.release_files }} | base64 -w0)" >> "$GITHUB_OUTPUT"
+      - name: "Release: Artifacts"
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ inputs.artifact }}
+          path: ${{ inputs.release_files }}
+          retention-days: ${{ inputs.retention_days }}
+
+  provenance:
+    needs: [build]
+    if: inputs.provenance
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v1.9.0
+    with:
+      base64-subjects: "${{ needs.build.outputs.hashes }}"
+      upload-assets: ${{ inputs.dry != true }}
+
+  release:
+    needs: [build]
+    if: inputs.dry != true
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    steps:
+      - name: "Setup: Harden Runner"
+        uses: step-security/harden-runner@eb238b55efaa70779f274895e782ed17c84f2895 # v2.6.1
+        with:
+          egress-policy: audit
+      - name: "Download: Release Artifact"
+        uses: actions/download-artifact@fb598a63ae348fa914e94cd0ff38f362e927b741 # tag=v2.1.0
+        with:
+          name: ${{ inputs.artifact }}
+      - name: "Release: GitHub"
         uses: softprops/action-gh-release@v1
+        if: inputs.dry != true
         with:
           prerelease: ${{ inputs.prerelease }}
-          # Use GH feature to populate the changelog automatically
-          generate_release_notes: true
+          generate_release_notes: ${{ inputs.generate_release_notes }}
           body_path: release_notes.txt
           fail_on_unmatched_files: true
           files: ${{ inputs.release_files }}
